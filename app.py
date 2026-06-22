@@ -1,7 +1,8 @@
 import streamlit as st
 import pandas as pd
-from io import BytesIO
+from io import BytesIO, StringIO
 from datetime import datetime
+import re
 
 st.set_page_config(
     page_title="MEDEK PÇ İzleme Sistemi",
@@ -14,9 +15,94 @@ st.write(
     """
     Bu uygulama, ders sorumlularının kendi dersleri için program çıktısı başarı düzeylerini
     öğrenci numarası bazında hesaplaması ve dönem sonu raporu üretmesi amacıyla hazırlanmıştır.
-    Öğrenci adı kullanılmaz; yalnızca öğrenci numarası ile işlem yapılır.
+    Öğrenci adı ve soyadı kullanılmaz; yalnızca öğrenci numarası ile işlem yapılır.
     """
 )
+
+# ---------------------------------------------------------
+# Yardımcı Fonksiyonlar
+# ---------------------------------------------------------
+
+def temiz_sutun_adi(col):
+    """
+    OBS çıktısında sütun adları Öğrenci No_5234FK, HBN_5234FK gibi gelebilir.
+    Bu fonksiyon sondaki ekleri temizler.
+    """
+    col = str(col).strip()
+    col = re.sub(r"_.*$", "", col)
+    return col.strip()
+
+
+def obs_verisini_duzenle(df):
+    """
+    OBS Excel veya kopyala-yapıştır verisinden öğrenci no ve HBN/ders başarı notunu otomatik bulur.
+    Ad-soyad alanlarını dikkate almaz.
+    """
+
+    df = df.copy()
+    df.columns = [temiz_sutun_adi(c) for c in df.columns]
+
+    ogrenci_no_col = None
+    not_col = None
+
+    for col in df.columns:
+        col_lower = str(col).lower()
+
+        if "öğrenci no" in col_lower or "ogrenci no" in col_lower or col_lower == "öğrenci no":
+            ogrenci_no_col = col
+
+        if col_lower == "hbn" or "hbn" in col_lower:
+            not_col = col
+
+    if ogrenci_no_col is None:
+        for col in df.columns:
+            col_lower = str(col).lower()
+            if "no" in col_lower and "öğrenci" in col_lower:
+                ogrenci_no_col = col
+
+    if not_col is None:
+        for col in df.columns:
+            col_lower = str(col).lower()
+            if "ders başarı" in col_lower or "başarı notu" in col_lower or "basari notu" in col_lower:
+                not_col = col
+
+    if ogrenci_no_col is None or not_col is None:
+        return None, ogrenci_no_col, not_col
+
+    sonuc = df[[ogrenci_no_col, not_col]].copy()
+    sonuc.columns = ["Öğrenci No", "Ders Başarı Notu"]
+
+    sonuc["Öğrenci No"] = sonuc["Öğrenci No"].astype(str).str.strip()
+    sonuc["Ders Başarı Notu"] = pd.to_numeric(sonuc["Ders Başarı Notu"], errors="coerce")
+
+    sonuc = sonuc.dropna(subset=["Öğrenci No", "Ders Başarı Notu"])
+    sonuc = sonuc[sonuc["Öğrenci No"] != ""]
+    sonuc = sonuc.reset_index(drop=True)
+
+    return sonuc, ogrenci_no_col, not_col
+
+
+def durum_belirle(puan, ulasti_esigi, kismen_esigi):
+    if puan >= ulasti_esigi:
+        return "Ulaştı"
+    elif puan >= kismen_esigi:
+        return "Kısmen ulaştı"
+    else:
+        return "Geliştirilmesi gerekir"
+
+
+def genel_degerlendirme(ortalama, ulasti_esigi, kismen_esigi):
+    if ortalama >= ulasti_esigi:
+        return "Yeterli"
+    elif ortalama >= kismen_esigi:
+        return "İzlenmeli"
+    else:
+        return "İyileştirme gerekli"
+
+
+# ---------------------------------------------------------
+# Ders Bilgileri
+# ---------------------------------------------------------
 
 st.sidebar.header("Ders Bilgileri")
 
@@ -40,6 +126,10 @@ kismen_esigi = st.sidebar.number_input(
     max_value=100,
     value=50
 )
+
+# ---------------------------------------------------------
+# PÇ Açıklamaları
+# ---------------------------------------------------------
 
 st.header("1. Dersin Program Çıktılarına Katkı Düzeyini Giriniz")
 
@@ -87,6 +177,10 @@ if aktif_pcler:
 else:
     st.warning("Henüz hiçbir program çıktısı seçilmedi.")
 
+# ---------------------------------------------------------
+# Ölçme-Değerlendirme Bilgileri
+# ---------------------------------------------------------
+
 st.header("2. Ölçme-Değerlendirme Bilgisi")
 
 olcme_turu = st.multiselect(
@@ -94,10 +188,14 @@ olcme_turu = st.multiselect(
     [
         "Ara sınav",
         "Final sınavı",
+        "Bütünleme sınavı",
         "Ödev",
         "Proje",
         "Uygulama",
         "Laboratuvar çalışması",
+        "Teknik çizim",
+        "Devre tasarımı",
+        "Kodlama çalışması",
         "Teknik rapor",
         "Sunum",
         "Performans değerlendirme"
@@ -107,62 +205,125 @@ olcme_turu = st.multiselect(
 
 kanit_aciklamasi = st.text_area(
     "Bu ders için sunulacak kanıtları kısaca yazınız",
-    "Sınav kâğıtları, ödev/proje dosyaları, uygulama raporları ve değerlendirme formları."
+    "Sınav kâğıtları, cevap anahtarları, ödev/proje dosyaları, uygulama çalışmaları, çizimler, teknik raporlar ve değerlendirme formları."
 )
 
-st.header("3. Öğrenci Numarası ve Ders Başarı Notlarını Giriniz")
+# ---------------------------------------------------------
+# Öğrenci Verisi Girişi
+# ---------------------------------------------------------
 
-st.write("Öğrenci adı yazılmayacaktır. Yalnızca öğrenci numarası ve ders başarı notu giriniz.")
+st.header("3. OBS Verisini Yükleyiniz veya Yapıştırınız")
 
-ornek_veri = pd.DataFrame(
-    {
-        "Öğrenci No": ["001", "002", "003"],
-        "Ders Başarı Notu": [75, 68, 82]
-    }
+veri_giris_yontemi = st.radio(
+    "Veri giriş yöntemini seçiniz",
+    [
+        "OBS Excel dosyası yükle",
+        "OBS tablosunu kopyala-yapıştır",
+        "Manuel giriş"
+    ]
 )
 
-ogrenci_df = st.data_editor(
-    ornek_veri,
-    num_rows="dynamic",
-    use_container_width=True
-)
+ogrenci_df = None
 
-def durum_belirle(puan):
-    if puan >= ulasti_esigi:
-        return "Ulaştı"
-    elif puan >= kismen_esigi:
-        return "Kısmen ulaştı"
-    else:
-        return "Geliştirilmesi gerekir"
+if veri_giris_yontemi == "OBS Excel dosyası yükle":
+    st.write("OBS’den aldığınız Excel dosyasını buraya yükleyiniz. Sistem Öğrenci No ve HBN sütunlarını otomatik alacaktır.")
 
-def genel_degerlendirme(ortalama):
-    if ortalama >= ulasti_esigi:
-        return "Yeterli"
-    elif ortalama >= kismen_esigi:
-        return "İzlenmeli"
-    else:
-        return "İyileştirme gerekli"
+    uploaded_file = st.file_uploader(
+        "OBS Excel dosyası yükle",
+        type=["xlsx", "xls"]
+    )
+
+    if uploaded_file is not None:
+        try:
+            obs_df = pd.read_excel(uploaded_file)
+            ogrenci_df, ogr_col, not_col = obs_verisini_duzenle(obs_df)
+
+            if ogrenci_df is None:
+                st.error("Öğrenci No veya HBN sütunu bulunamadı. Lütfen OBS dosyasını kontrol ediniz.")
+                st.write("Bulunan sütunlar:")
+                st.write(list(obs_df.columns))
+            else:
+                st.success(f"Veri başarıyla okundu. Kullanılan sütunlar: {ogr_col} ve {not_col}")
+                st.dataframe(ogrenci_df, use_container_width=True)
+
+        except Exception as e:
+            st.error("Excel dosyası okunurken hata oluştu.")
+            st.write(e)
+
+elif veri_giris_yontemi == "OBS tablosunu kopyala-yapıştır":
+    st.write(
+        """
+        OBS Excel dosyasındaki tabloyu başlık satırıyla birlikte kopyalayıp aşağıdaki kutuya yapıştırınız.
+        Sistem Öğrenci No ve HBN sütunlarını otomatik alacaktır.
+        """
+    )
+
+    yapistirilan_veri = st.text_area(
+        "OBS tablosunu buraya yapıştırınız",
+        height=250
+    )
+
+    if yapistirilan_veri.strip() != "":
+        try:
+            obs_df = pd.read_csv(StringIO(yapistirilan_veri), sep="\t")
+            ogrenci_df, ogr_col, not_col = obs_verisini_duzenle(obs_df)
+
+            if ogrenci_df is None:
+                st.error("Öğrenci No veya HBN sütunu bulunamadı. Lütfen tabloyu başlık satırıyla birlikte yapıştırınız.")
+                st.write("Bulunan sütunlar:")
+                st.write(list(obs_df.columns))
+            else:
+                st.success(f"Veri başarıyla okundu. Kullanılan sütunlar: {ogr_col} ve {not_col}")
+                st.dataframe(ogrenci_df, use_container_width=True)
+
+        except Exception as e:
+            st.error("Yapıştırılan veri okunurken hata oluştu.")
+            st.write(e)
+
+else:
+    st.write("Öğrenci adı yazılmayacaktır. Yalnızca öğrenci numarası ve ders başarı notu giriniz.")
+
+    ornek_veri = pd.DataFrame(
+        {
+            "Öğrenci No": ["001", "002", "003"],
+            "Ders Başarı Notu": [75, 68, 82]
+        }
+    )
+
+    ogrenci_df = st.data_editor(
+        ornek_veri,
+        num_rows="dynamic",
+        use_container_width=True
+    )
+
+    ogrenci_df["Ders Başarı Notu"] = pd.to_numeric(
+        ogrenci_df["Ders Başarı Notu"],
+        errors="coerce"
+    )
+
+    ogrenci_df = ogrenci_df.dropna(subset=["Öğrenci No", "Ders Başarı Notu"])
+
+# ---------------------------------------------------------
+# Raporlama
+# ---------------------------------------------------------
 
 st.header("4. Rapor Oluştur")
 
 if st.button("Raporu Hesapla"):
     if len(aktif_pcler) == 0:
         st.error("En az bir program çıktısı için katkı düzeyi girilmelidir.")
-    elif ogrenci_df.empty:
-        st.error("Öğrenci notları girilmelidir.")
+
+    elif ogrenci_df is None or ogrenci_df.empty:
+        st.error("Öğrenci notları yüklenmeli, yapıştırılmalı veya manuel girilmelidir.")
+
     else:
-        ogrenci_df["Ders Başarı Notu"] = pd.to_numeric(
-            ogrenci_df["Ders Başarı Notu"],
-            errors="coerce"
-        )
-
-        ogrenci_df = ogrenci_df.dropna(subset=["Ders Başarı Notu"])
-
         sonuc_df = ogrenci_df.copy()
 
         for pc in aktif_pcler:
             sonuc_df[pc] = sonuc_df["Ders Başarı Notu"]
-            sonuc_df[f"{pc} Durum"] = sonuc_df[pc].apply(durum_belirle)
+            sonuc_df[f"{pc} Durum"] = sonuc_df[pc].apply(
+                lambda x: durum_belirle(x, ulasti_esigi, kismen_esigi)
+            )
 
         st.subheader("Öğrenci Bazlı Program Çıktısı Başarı Sonuçları")
         st.dataframe(sonuc_df, use_container_width=True)
@@ -192,7 +353,11 @@ if st.button("Raporu Hesapla"):
                     "Ulaşan Öğrenci Oranı (%)": round(ulasti_orani, 2),
                     "Kısmen Ulaşan Oranı (%)": round(kismen_orani, 2),
                     "Geliştirilmesi Gereken Oran (%)": round(gelistirilmeli_orani, 2),
-                    "Genel Değerlendirme": genel_degerlendirme(ortalama)
+                    "Genel Değerlendirme": genel_degerlendirme(
+                        ortalama,
+                        ulasti_esigi,
+                        kismen_esigi
+                    )
                 }
             )
 
@@ -208,8 +373,10 @@ if st.button("Raporu Hesapla"):
 Dersin ilişkilendirildiği program çıktıları {", ".join(aktif_pcler)} olarak belirlenmiştir. 
 Ölçme-değerlendirme sürecinde {", ".join(olcme_turu)} araçları kullanılmıştır. 
 Öğrenci başarı notları üzerinden ilgili program çıktıları için ortalama başarı, ulaşan öğrenci oranı, kısmen ulaşan öğrenci oranı ve geliştirilmesi gereken öğrenci oranı hesaplanmıştır. 
+Değerlendirme sürecinde öğrenci adları kullanılmamış, yalnızca öğrenci numarası bazlı veriler esas alınmıştır. 
 Elde edilen sonuçlar ders bazlı program çıktısı değerlendirme raporuna dönüştürülmüş ve dönemsel izleme kapsamında kayıt altına alınmıştır.
 """
+
         st.write(rapor_metni)
 
         st.subheader("İyileştirme Önerileri")
